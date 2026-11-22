@@ -122,6 +122,7 @@
     border-radius: 4px; 
     border: 1px solid #eee; 
     box-sizing: border-box;
+    cursor: pointer;
     transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
   }
   
@@ -132,6 +133,7 @@
     display: inline-block; 
     flex-shrink: 0; 
     box-sizing: border-box;
+    cursor: pointer;
   }
 
   .legend-color.active-color-marker {
@@ -144,6 +146,18 @@
     box-shadow: inset 0 0 0 1px #ffc107, 0 2px 5px rgba(0,0,0,0.12);
     filter: brightness(1.03);
     color: #111;
+  }
+
+  .legend-item.engaged-legend {
+    background-color: #d4edda !important;
+    border-color: #28a745 !important;
+    box-shadow: inset 0 0 0 1px #28a745, 0 2px 5px rgba(0,0,0,0.15);
+    color: #111;
+    font-weight: bold;
+  }
+
+  .legend-color.engaged-color-marker {
+    box-shadow: inset 0 0 0 2px #fff, 0 0 0 2px #28a745;
   }
 </style>
 </head>
@@ -307,6 +321,11 @@ const CHORDS_4 = [
 
 const DEFAULT_RED = "#ff3333";
 
+// --- MODE INTERVALLE / ACCORD ENGAGÉ ---
+// Un seul engageable à la fois ; la touche Espace désengage.
+let engagedDef = null; // { kind: 'interval', semi } | { kind: 'chord', intervals }
+const keyToNotes = new Map(); // touche physique -> notes virtuelles jouées
+
 function groupChordDefsWithIndex(chordsArray) {
   const map = new Map();
   chordsArray.forEach((c, originalIndex) => {
@@ -316,22 +335,65 @@ function groupChordDefsWithIndex(chordsArray) {
   return Array.from(map.entries()).map(([name, variants]) => ({ name, variants }));
 }
 
+function setEngaged(def) {
+  engagedDef = def;
+  document.querySelectorAll('.legend-item').forEach(el => el.classList.remove('engaged-legend'));
+  document.querySelectorAll('.legend-color').forEach(el => el.classList.remove('engaged-color-marker'));
+  if (engagedDef) {
+    engagedDef.el.classList.add('engaged-legend');
+    if (engagedDef.colorEl) engagedDef.colorEl.classList.add('engaged-color-marker');
+  }
+  updateDisplay();
+}
+
 function initLegends() {
   const lInt = document.getElementById("legend-intervals");
   INTERVAL_DEFS.forEach((i) => {
     lInt.innerHTML += `<div class="legend-item" data-int-semi="${i.semi}"><span class="legend-color" style="background:${i.color}"></span><span>${i.name}</span></div>`;
   });
-
-  const lCh3 = document.getElementById("legend-chords-3");
-  groupChordDefsWithIndex(CHORDS_3).forEach((group) => {
-    let variantsHtml = group.variants.map(v => `<span class="legend-color" style="background:${v.color}" data-chord-index-3="${v.originalIndex}"></span>`).join('');
-    lCh3.innerHTML += `<div class="legend-item" data-chord-name="${group.name}">${variantsHtml}<span>${group.name}</span></div>`;
+  lInt.querySelectorAll('.legend-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const semi = parseInt(el.getAttribute('data-int-semi'));
+      setEngaged(engagedDef && engagedDef.el === el ? null : { kind: 'interval', semi, el });
+    });
   });
 
-  const lCh4 = document.getElementById("legend-chords-4");
-  groupChordDefsWithIndex(CHORDS_4).forEach((group) => {
-    let variantsHtml = group.variants.map(v => `<span class="legend-color" style="background:${v.color}" data-chord-index-4="${v.originalIndex}"></span>`).join('');
-    lCh4.innerHTML += `<div class="legend-item" data-chord-name="${group.name}">${variantsHtml}<span>${group.name}</span></div>`;
+  [['legend-chords-3', CHORDS_3, 'data-chord-index-3'], ['legend-chords-4', CHORDS_4, 'data-chord-index-4']].forEach(([gridId, defs, sqAttr]) => {
+    const grid = document.getElementById(gridId);
+    groupChordDefsWithIndex(defs).forEach((group) => {
+      const attr = sqAttr === 'data-chord-index-3' ? 'data-chord-index-3' : 'data-chord-index-4';
+      const variantsHtml = group.variants.map(v => `<span class="legend-color" style="background:${v.color}" ${attr}="${v.originalIndex}"></span>`).join('');
+      grid.innerHTML += `<div class="legend-item" data-chord-name="${group.name}">${variantsHtml}<span>${group.name}</span></div>`;
+    });
+
+    grid.querySelectorAll('.legend-item').forEach(el => {
+      const chordName = el.getAttribute('data-chord-name');
+      const squares = Array.from(el.querySelectorAll('.legend-color'));
+      el._variants = squares.map(sq => parseInt(sq.getAttribute(sqAttr)));
+      el._pos = 0;
+
+      const engageAt = (pos) => {
+        const defIdx = el._variants[pos];
+        setEngaged({ kind: 'chord', intervals: defs[defIdx].intervals, el, colorEl: squares[pos], variantPos: pos });
+      };
+
+      el.addEventListener('click', () => {
+        if (engagedDef && engagedDef.el === el) {
+          setEngaged(null);
+        } else {
+          el._pos = 0;
+          engageAt(0);
+        }
+      });
+
+      squares.forEach((sq, pos) => {
+        sq.addEventListener('click', (e) => {
+          e.stopPropagation();
+          el._pos = pos;
+          engageAt(pos);
+        });
+      });
+    });
   });
 }
 initLegends();
@@ -534,37 +596,68 @@ function audioOff(n) {
   synth.triggerRelease(noteName, Tone.now());
 }
 
-function noteOn(n, velocity = 0.8){
-  if (n < LOW || n > HIGH) return;
-  if (Tone.context.state !== 'running') {
-    Tone.start();
+// Notes virtuelles correspondant à l'engagement courant, à partir d'une note racine
+function getEngagedNotes(n) {
+  if (!engagedDef) return [n];
+  if (engagedDef.kind === 'interval') {
+    const s = engagedDef.semi;
+    if (n + s <= HIGH) return [n, n + s];
+    if (n - s >= LOW) return [n, n - s];
+    return [n];
   }
-  // Si la note est déjà tenue (ex: re-déclenchement MIDI rapide), on la relâche d'abord proprement
+  const list = [n];
+  let cur = n;
+  for (const iv of engagedDef.intervals) {
+    cur += iv;
+    if (cur >= LOW && cur <= HIGH) list.push(cur);
+  }
+  return list;
+}
+
+function noteSingleOn(n, velocity) {
   if (held.has(n)) {
-    noteOff(n);
+    releaseSingleNote(n);
   }
   held.add(n);
   startRibbonSegment(n, DEFAULT_RED);
   audioOn(n, velocity);
-  updateDisplay();
 }
 
-function noteOff(n){
-  if (!held.has(n)) return;
+function releaseSingleNote(n) {
   held.delete(n);
-  
   const ribbon = activeRibbons.get(n);
   if (ribbon) {
     ribbon.active = false;
     activeRibbons.delete(n);
   }
-
   audioOff(n);
+}
+
+function noteOn(n, velocity = 0.8){
+  if (n < LOW || n > HIGH) return;
+  if (Tone.context.state !== 'running') {
+    Tone.start();
+  }
+  const group = getEngagedNotes(n);
+  keyToNotes.set(n, group);
+  group.forEach(m => noteSingleOn(m, velocity));
+  updateDisplay();
+}
+
+function noteOff(n){
+  const group = keyToNotes.get(n);
+  if (group) {
+    keyToNotes.delete(n);
+    group.forEach(m => releaseSingleNote(m));
+  } else if (held.has(n)) {
+    releaseSingleNote(n);
+  }
   updateDisplay();
 }
 
 function releaseAllNotes() {
-  Array.from(held).forEach(n => noteOff(n));
+  Array.from(held).forEach(n => releaseSingleNote(n));
+  keyToNotes.clear();
   if (synth) synth.releaseAll();
 }
 
@@ -842,6 +935,12 @@ function updateDisplay() {
       el.classList.remove('active-legend');
     }
   });
+
+  // Réapplique l'état visuel "engagé" (updateDisplay efface les marqueurs de couleur)
+  if (engagedDef) {
+    engagedDef.el.classList.add('engaged-legend');
+    if (engagedDef.colorEl) engagedDef.colorEl.classList.add('engaged-color-marker');
+  }
 }
 
 // --- LECTEUR DE FICHIER MIDI ---
@@ -1038,6 +1137,11 @@ speedSlider.addEventListener("input", (e) => {
 // --- CLAVIER ORDI ---
 const pressed = {};
 addEventListener("keydown", e => {
+  if (e.code === "Space" || e.key === " ") {
+    setEngaged(null);
+    e.preventDefault();
+    return;
+  }
   if (e.key === "ArrowLeft" || e.key === "ArrowRight"){
     const dir = e.key === "ArrowLeft" ? -1 : 1;
     let lo = 60 + 12 * octaveShift, hi = lo + 28;
